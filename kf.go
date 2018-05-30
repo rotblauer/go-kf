@@ -5,21 +5,37 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/user"
 	"path/filepath"
 )
+
+type StoreConfig struct {
+	BaseDir string
+	Locking bool
+}
 
 // Store is the root directory in which to keep the key-file store.
 type Store struct {
 	baseDir string
+	locking bool
+	locked  bool
 }
 
 // NewStore creates a new storage instance.
-func NewStore(baseDir string) *Store {
-	baseDir = filepath.Clean(baseDir)
+func NewStore(c *StoreConfig) *Store {
+	if c.BaseDir == "" {
+		usr, err := user.Current()
+		if err != nil {
+			log.Fatal(err)
+		}
+		c.BaseDir = filepath.Join(usr.HomeDir, ".kf")
+	}
+	baseDir := filepath.Clean(c.BaseDir)
 	baseDir, e := filepath.Abs(baseDir)
 	if e != nil {
 		log.Fatalln(e)
 	}
+	s := &Store{baseDir: baseDir}
 	f, e := os.Open(baseDir)
 
 	// initialize new dir
@@ -27,7 +43,7 @@ func NewStore(baseDir string) *Store {
 		if e := os.MkdirAll(baseDir, os.ModePerm); e != nil {
 			log.Fatalln(e)
 		}
-		return &Store{baseDir: baseDir}
+		return s
 	} else if e != nil && os.IsExist(e) {
 		log.Fatalln(e)
 	}
@@ -39,11 +55,17 @@ func NewStore(baseDir string) *Store {
 	if !stat.IsDir() {
 		log.Fatalln("there is a file in the way", baseDir)
 	}
-	return &Store{baseDir: baseDir}
+	return s
 }
 
 // Set saves data.
 func (s *Store) Set(key string, value []byte) (err error) {
+	for s.locking && s.locked {
+	}
+	if s.locking {
+		s.lock()
+		defer s.unlock()
+	}
 	key = s.join(key)
 	if e := os.MkdirAll(filepath.Dir(key), os.ModePerm); e != nil {
 		return e
@@ -53,12 +75,24 @@ func (s *Store) Set(key string, value []byte) (err error) {
 
 // GetValue gets data from a key store.
 func (s *Store) GetValue(key string) (value []byte, err error) {
+	for s.locking && s.locked {
+	}
+	if s.locking {
+		s.lock()
+		defer s.unlock()
+	}
 	key = s.join(key)
 	return ioutil.ReadFile(key)
 }
 
 // GetKeys gets all keys under a key store.
 func (s *Store) GetKeys(bucket string) (keys []string, err error) {
+	for s.locking && s.locked {
+	}
+	if s.locking {
+		s.lock()
+		defer s.unlock()
+	}
 	bucket = s.join(bucket)
 	if !existsDir(bucket) {
 		return nil, errors.New("uninitialized bucket")
@@ -75,6 +109,12 @@ func (s *Store) GetKeys(bucket string) (keys []string, err error) {
 
 // Delete deletes data.
 func (s *Store) Delete(key string) (err error) {
+	for s.locking && s.locked {
+	}
+	if s.locking {
+		s.lock()
+		defer s.unlock()
+	}
 	key = s.join(key)
 	return os.RemoveAll(key)
 }
@@ -82,6 +122,18 @@ func (s *Store) Delete(key string) (err error) {
 // BaseDir returns the base directory for storage..
 func (s *Store) BaseDir() string {
 	return s.baseDir
+}
+
+func (s *Store) lock() {
+	os.Create(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
+}
+
+func (s *Store) unlock() {
+	os.Remove(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
+}
+
+func (s *Store) isLocked() bool {
+	return s.locked || existsFile(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
 }
 
 func (s *Store) join(key string) (fullpath string) {
