@@ -2,6 +2,7 @@ package kf
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 )
 
+// StoreConfig configures a new Store.
 type StoreConfig struct {
 	BaseDir string
 	Locking bool
@@ -22,20 +24,20 @@ type Store struct {
 }
 
 // NewStore creates a new storage instance.
-func NewStore(c *StoreConfig) *Store {
+func NewStore(c *StoreConfig) (*Store, error) {
 	if c.BaseDir == "" {
 		usr, err := user.Current()
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		c.BaseDir = filepath.Join(usr.HomeDir, ".kf")
 	}
 	baseDir := filepath.Clean(c.BaseDir)
 	baseDir, e := filepath.Abs(baseDir)
 	if e != nil {
-		log.Fatalln(e)
+		return nil, e
 	}
-	s := &Store{baseDir: baseDir}
+	s := &Store{baseDir: baseDir, locking: c.Locking}
 	f, e := os.Open(baseDir)
 
 	// initialize new dir
@@ -43,19 +45,19 @@ func NewStore(c *StoreConfig) *Store {
 		if e := os.MkdirAll(baseDir, os.ModePerm); e != nil {
 			log.Fatalln(e)
 		}
-		return s
+		return s, nil
 	} else if e != nil && os.IsExist(e) {
 		log.Fatalln(e)
 	}
 
 	stat, err := f.Stat()
 	if err != nil {
-		log.Fatalln(err)
+		return nil, err
 	}
 	if !stat.IsDir() {
-		log.Fatalln("there is a file in the way", baseDir)
+		return nil, fmt.Errorf("there is a file in the way: %s", baseDir)
 	}
-	return s
+	return s, nil
 }
 
 // Set saves data.
@@ -146,7 +148,7 @@ func existsDir(dpath string) bool {
 		return false
 	}
 	stat, e := f.Stat()
-	return e != nil && stat.IsDir()
+	return e == nil && stat.IsDir()
 }
 
 func existsFile(fpath string) bool {
@@ -155,5 +157,5 @@ func existsFile(fpath string) bool {
 		return false
 	}
 	stat, e := f.Stat()
-	return e != nil && !stat.IsDir()
+	return e == nil && !stat.IsDir()
 }
