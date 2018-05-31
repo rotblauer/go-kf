@@ -85,6 +85,14 @@ func NewStore(c *StoreConfig) (*Store, error) {
 	return s, nil
 }
 
+// Close closes a KV database.
+func (s *Store) Close() error {
+	if s.kv {
+		return s.db.Close()
+	}
+	return errors.New("close only applies to KV db")
+}
+
 // Set saves data.
 func (s *Store) Set(key string, value []byte) (err error) {
 	if s.kv {
