@@ -6,68 +6,39 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
-
-	bolt "github.com/coreos/bbolt"
 )
 
 // StoreConfig configures a new Store.
 type StoreConfig struct {
 	BaseDir string
 	Locking bool
-	KV      bool
 }
 
 // Store is the root directory in which to keep the key-file store.
 type Store struct {
-	baseDir  string
-	locking  bool
-	locked   bool
-	kv       bool
-	db       *bolt.DB
-	kvBucket []byte
+	baseDir string
+	locking bool
+	locked  bool
 }
 
 // NewStore creates a new storage instance.
 func NewStore(c *StoreConfig) (*Store, error) {
 	if c.BaseDir == "" {
-		usr, err := user.Current()
-		if err != nil {
-			return nil, err
-		}
-		c.BaseDir = filepath.Join(usr.HomeDir, ".kf")
+		return nil, errors.New("base directory not specified")
 	}
-	baseDir := filepath.Clean(c.BaseDir)
-	baseDir, e := filepath.Abs(baseDir)
-	if e != nil {
-		return nil, e
-	}
-	s := &Store{baseDir: baseDir, locking: c.Locking, kv: c.KV}
+	s := &Store{baseDir: c.BaseDir, locking: c.Locking}
 
-	// getting too many open files error, turnin to darkside
-	if s.kv {
-		db, e := bolt.Open(s.join(".goddamnboltdatabasedontnameyourkeysthis"), os.ModePerm, nil)
-		if e != nil {
-			return nil, e
-		}
-		s.db = db
-		s.kvBucket = []byte("data")
-		if e := s.db.Update(func(tx *bolt.Tx) error {
-			_, e := tx.CreateBucketIfNotExists(s.kvBucket)
-			return e
-		}); e != nil {
-			return nil, e
-		}
-		return s, nil
-	}
-
-	f, e := os.Open(baseDir)
+	f, e := os.Open(c.BaseDir)
 
 	// initialize new dir
+	// IF the baseDir does not exists, create it (os.ModePerm)
+	//   If fail to create, FAIL
+	// IF the baseDir does exist and it's a directory, OK
+	// IF the baseDir does exist and it's NOT a directory, FAIL
 	if e != nil && os.IsNotExist(e) {
-		if e := os.MkdirAll(baseDir, os.ModePerm); e != nil {
+		if e := os.MkdirAll(c.BaseDir, os.ModePerm); e != nil {
 			log.Fatalln(e)
 		}
 		return s, nil
@@ -80,44 +51,42 @@ func NewStore(c *StoreConfig) (*Store, error) {
 		return nil, err
 	}
 	if !stat.IsDir() {
-		return nil, fmt.Errorf("there is a file in the way: %s", baseDir)
+		return nil, fmt.Errorf("there is a file in the way: %s", c.BaseDir)
 	}
 	return s, nil
 }
 
-// Close closes a KV database.
-func (s *Store) Close() error {
-	if s.kv {
-		return s.db.Close()
-	}
-	return errors.New("close only applies to KV db")
-}
-
 // Set saves data.
-func (s *Store) Set(key string, value []byte) (err error) {
-	if s.kv {
-		keys := strings.Split(key, string(os.PathSeparator))
-		return s.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(s.kvBucket)
-			if len(keys) > 1 {
-				for i, k := range keys {
-					if i != len(keys)-1 {
-						b, _ = b.CreateBucketIfNotExists([]byte(k))
-					}
-				}
-			}
-			return b.Put([]byte(keys[len(keys)-1]), value)
-		})
-	}
-
-	for s.locking && s.locked {
+func (s *Store) Set(value []byte, nkey ...string) (err error) {
+	for s.isLocked() {
 	}
 	if s.locking {
 		s.lock()
 		defer s.unlock()
 	}
+	var key string
+	if len(key) > 1 {
+		key = filepath.Join(nkey...)
+	} else if len(key) == 1 {
+		key = nkey[0]
+	} else {
+		return errors.New("no key provided")
+	}
+
 	key = s.join(key)
-	if e := os.MkdirAll(filepath.Dir(key), os.ModePerm); e != nil {
+
+	var p = filepath.Dir(key)
+
+	// if key has a trailing slack (eg. path/to/key/), then intrepret as command to establish dir
+	if strings.HasSuffix(key, string(filepath.Separator)) {
+		p = key
+		if value != nil {
+			return fmt.Errorf("cannot use %s as endpoint for value storage: %s; trailing slash for key denotes dir, and a value must be stored in a file", key, string(value))
+		}
+
+		return os.MkdirAll(p, os.ModePerm)
+	}
+	if e := os.MkdirAll(p, os.ModePerm); e != nil {
 		return e
 	}
 	return ioutil.WriteFile(key, value, os.ModePerm)
@@ -125,27 +94,7 @@ func (s *Store) Set(key string, value []byte) (err error) {
 
 // GetValue gets data from a key store.
 func (s *Store) GetValue(key string) (value []byte, err error) {
-	if s.kv {
-		keys := strings.Split(key, string(os.PathSeparator))
-		err = s.db.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket(s.kvBucket)
-			if len(keys) > 1 {
-				for i, k := range keys {
-					if i != len(keys)-1 {
-						b = b.Bucket([]byte(k))
-						if b == nil {
-							return errors.New("bucket does not exist")
-						}
-					}
-				}
-			}
-			value = b.Get([]byte(keys[len(keys)-1]))
-			return nil
-		})
-		return value, err
-	}
-
-	for s.locking && s.locked {
+	for s.isLocked() {
 	}
 	if s.locking {
 		s.lock()
@@ -156,36 +105,18 @@ func (s *Store) GetValue(key string) (value []byte, err error) {
 }
 
 // GetKeys gets all keys under a key store.
-func (s *Store) GetKeys(bucket string) (keys []string, err error) {
-	if s.kv {
-		keys := strings.Split(bucket, string(os.PathSeparator))
-		err = s.db.View(func(tx *bolt.Tx) error {
-			b := tx.Bucket(s.kvBucket)
-			for _, k := range keys {
-				b = b.Bucket([]byte(k))
-				if b == nil {
-					return errors.New("bucket does not exist")
-				}
-			}
-			return b.ForEach(func(k []byte, v []byte) error {
-				keys = append(keys, string(k))
-				return nil
-			})
-		})
-		return keys, err
-	}
-
-	for s.locking && s.locked {
+func (s *Store) GetKeys(ppath string) (keys []string, err error) {
+	for s.isLocked() {
 	}
 	if s.locking {
 		s.lock()
 		defer s.unlock()
 	}
-	bucket = s.join(bucket)
-	if !existsDir(bucket) {
-		return nil, errors.New("uninitialized bucket")
+	ppath = s.join(ppath)
+	if !ExistsDir(ppath) {
+		return nil, errors.New("uninitialized ppath (dir)")
 	}
-	filepath.Walk(bucket, func(p string, f os.FileInfo, e error) error {
+	filepath.Walk(ppath, func(p string, f os.FileInfo, e error) error {
 		if e != nil {
 			err = e
 			return err
@@ -196,47 +127,19 @@ func (s *Store) GetKeys(bucket string) (keys []string, err error) {
 		keys = append(keys, f.Name())
 		return nil
 	})
-	// fs, err := ioutil.ReadDir(bucket)
+	// fs, err := ioutil.ReadDir(ppath) // nonrecursive?
 	if err != nil {
 		return nil, err
 	}
 	// for _, f := range fs {
-	// 	keys = append(keys, filepath.Base(f.Name()))
+	// 	keys = append(keys, fileppathth.Base(f.Name()))
 	// }
 	return keys, err
 }
 
-// Delete deletes data.
-// TODO. Handle deleting buckets, too.
+// Delete deletes data. Equivalently to 'rm -rf', it does not care if it gets a dir path or file path.
 func (s *Store) Delete(key string) (err error) {
-	if s.kv {
-		delBucket := strings.HasSuffix(key, string(os.PathSeparator))
-		keys := strings.Split(key, string(os.PathSeparator))
-		return s.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(s.kvBucket)
-			if len(keys) > 1 {
-				for i, k := range keys {
-					if !delBucket && i != len(keys)-1 {
-						b = b.Bucket([]byte(k))
-						if b == nil {
-							return errors.New("uninitialized bucket")
-						}
-					} else {
-						b = b.Bucket([]byte(k))
-						if b == nil {
-							return errors.New("uninitialized bucket")
-						}
-					}
-				}
-			}
-			if delBucket {
-				return tx.DeleteBucket([]byte(keys[len(keys)-1]))
-			}
-			return b.Delete([]byte(keys[len(keys)-1]))
-		})
-	}
-
-	for s.locking && s.locked {
+	for s.isLocked() {
 	}
 	if s.locking {
 		s.lock()
@@ -252,22 +155,25 @@ func (s *Store) BaseDir() string {
 }
 
 func (s *Store) lock() {
+	s.locked = true
 	os.Create(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
 }
 
 func (s *Store) unlock() {
+	s.locked = false
 	os.Remove(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
 }
 
 func (s *Store) isLocked() bool {
-	return s.locked || existsFile(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY"))
+	return s.locking && (s.locked || ExistsFile(s.join(".LOCKDONOTFUCKWITHMEORUSEMEASAKEY")))
 }
 
 func (s *Store) join(key string) (fullpath string) {
 	return filepath.Join(s.baseDir, filepath.Clean(key))
 }
 
-func existsDir(dpath string) bool {
+// ExistsDir returns whether dpath exists as a directory.
+func ExistsDir(dpath string) bool {
 	f, e := os.Open(dpath)
 	if e != nil && os.IsNotExist(e) {
 		return false
@@ -276,7 +182,8 @@ func existsDir(dpath string) bool {
 	return e == nil && stat.IsDir()
 }
 
-func existsFile(fpath string) bool {
+// ExistsFile returns whether fpath exists as a file.
+func ExistsFile(fpath string) bool {
 	f, e := os.Open(fpath)
 	if e != nil && os.IsNotExist(e) {
 		return false
